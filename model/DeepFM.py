@@ -8,8 +8,24 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import graph_observer
+from torch.autograd.profiler import record_function
+from caffe2.python import core
+core.GlobalInit(
+    [
+        "python",
+        "--pytorch_enable_execution_graph_observer=true",
+        "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
+    ]
+)
 
 from time import time
+
+def _time(is_cuda):
+    if is_cuda:
+        torch.cuda.synchronize()
+
+    return time()
 
 
 class DeepFM(nn.Module):
@@ -53,7 +69,9 @@ class DeepFM(nn.Module):
         """
             check if use cuda
         """
+        self.use_cuda = False
         if use_cuda and torch.cuda.is_available():
+            self.use_cuda = True
             self.device = torch.device('cuda')
         else:
             self.device = torch.device('cpu')
@@ -61,20 +79,31 @@ class DeepFM(nn.Module):
             init fm part
         """
 
-#        self.fm_first_order_embeddings = nn.ModuleList(
-#            [nn.Embedding(feature_size, 1) for feature_size in self.feature_sizes])
         fm_first_order_Linears = nn.ModuleList(
                 [nn.Linear(feature_size, self.embedding_size) for feature_size in self.feature_sizes[:13]])
-        fm_first_order_embeddings = nn.ModuleList(
-                [nn.Embedding(feature_size, self.embedding_size) for feature_size in self.feature_sizes[13:40]])
+        import table_batched_embeddings_ops
+        fm_first_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+            26,
+            self.feature_sizes[13:],
+            self.embedding_size,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD,
+            learning_rate=1e-9,
+            eps=None,
+            stochastic_rounding=False,
+        )])
         self.fm_first_order_models = fm_first_order_Linears.extend(fm_first_order_embeddings)
 
-#        self.fm_second_order_embeddings = nn.ModuleList(
-#            [nn.Embedding(feature_size, self.embedding_size) for feature_size in self.feature_sizes])
         fm_second_order_Linears = nn.ModuleList(
                 [nn.Linear(feature_size, self.embedding_size) for feature_size in self.feature_sizes[:13]])
-        fm_second_order_embeddings = nn.ModuleList(
-                [nn.Embedding(feature_size, self.embedding_size) for feature_size in self.feature_sizes[13:40]])
+        fm_second_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+            26,
+            self.feature_sizes[13:],
+            self.embedding_size,
+            optimizer=table_batched_embeddings_ops.Optimizer.SGD,
+            learning_rate=1e-9,
+            eps=None,
+            stochastic_rounding=False,
+        )])
         self.fm_second_order_models = fm_second_order_Linears.extend(fm_second_order_embeddings)
 
         """
@@ -102,72 +131,82 @@ class DeepFM(nn.Module):
         """
             fm part
         """
-        emb = self.fm_first_order_models[20]
-#        print(Xi.size())
-        for num in Xi[:, 20, :][0]:
-            if num > self.feature_sizes[20]:
-                print("index out")
+        # Non-batched: 
+        # - embedding input per table: (B, L(=1))
+        # - embedding output per table: (B, 1, D), summed to (B, D), 26 outputs in total
+        # - Xv shape: (B, 39), Xv[:, i] shape: (B); element = (D, B) dot_mul (B) = (D, B)
+        # - fm_first/second_order_emb_arr: len of 39, (B, D)
+        # - fm_first_order: (B, 39 * D)
+        # - fm_second_order: (B, D)
+        # Batched:
+        # - embedding input per table: (B, 26, L(=1))
+        # - embedding output per table: (B, 26, D); Xv shape: (B, 39)
+        # - fm_first_order_emb_arr: （B, 26, D), transposed to (26, D, B); 
+        # - Xv shape: (B, 39), Xv[:, i:] shape (B, 26), transposed to (26, B)
+        # - fm_first_order_emb_arr: len of 14: 13 (B, D) & 1 (B, 26 * D) -> Pre-concatenated
+        # - fm_second_order_emb_arr: len of 14: 13 (B, D) & 1 (B, 26, D) -> For concat and sum
+        # - fm_first_order: (B, 39 * D)
+        # - fm_second_order: (B, D)
 
-#        fm_first_order_emb_arr = [(torch.sum(emb(Xi[:, i, :]), 1).t() * Xv[:, i]).t() for i, emb in enumerate(self.fm_first_order_models)]
-#        fm_first_order_emb_arr = [(emb(Xi[:, i, :]) * Xv[:, i])  for i, emb in enumerate(self.fm_first_order_models)]
         fm_first_order_emb_arr = []
         for i, emb in enumerate(self.fm_first_order_models):
-            if i <=12:
+            if i < 13: # Linear
                 Xi_tem = Xi[:, i, :].to(device=self.device, dtype=torch.float)
                 fm_first_order_emb_arr.append((torch.sum(emb(Xi_tem).unsqueeze(1), 1).t() * Xv[:, i]).t())
-            else:
-                Xi_tem = Xi[:, i, :].to(device=self.device, dtype=torch.long)
-                fm_first_order_emb_arr.append((torch.sum(emb(Xi_tem), 1).t() * Xv[:, i]).t())
-#        print("successful")      
-#        print(len(fm_first_order_emb_arr))
+            else: # Emb
+                Xi_tem = Xi[:, i:, :].to(device=self.device, dtype=torch.long)
+                B, S, _ = Xi_tem.shape
+                Xi_tem = Xi_tem.reshape((-1)).int()
+                offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
+                fm_first_order_emb_arr.append((emb(Xi_tem, offsets).view(S, -1, B) * Xv[:, i:].reshape(S, 1, B)).view(B, -1))
         fm_first_order = torch.cat(fm_first_order_emb_arr, 1)
-        # use 2xy = (x+y)^2 - x^2 - y^2 reduce calculation
-#        fm_second_order_emb_arr = [(torch.sum(emb(Xi[:, i, :]), 1).t() * Xv[:, i]).t() for i, emb in enumerate(self.fm_second_order_models)]
-        # fm_second_order_emb_arr = [(emb(Xi[:, i]) * Xv[:, i]) for i, emb in enumerate(self.fm_second_order_embeddings)]
+
+        # use 2xy = (x+y)^2 - x^2 - y^2 to reduce calculation
         fm_second_order_emb_arr = []
         for i, emb in enumerate(self.fm_second_order_models):
-            if i <=12:
+            if i < 13:
                 Xi_tem = Xi[:, i, :].to(device=self.device, dtype=torch.float)
                 fm_second_order_emb_arr.append((torch.sum(emb(Xi_tem).unsqueeze(1), 1).t() * Xv[:, i]).t())
             else:
-                Xi_tem = Xi[:, i, :].to(device=self.device, dtype=torch.long)
-                fm_second_order_emb_arr.append((torch.sum(emb(Xi_tem), 1).t() * Xv[:, i]).t())
-                
-        fm_sum_second_order_emb = sum(fm_second_order_emb_arr)
+                Xi_tem = Xi[:, i:, :].to(device=self.device, dtype=torch.long)
+                B, S, _ = Xi_tem.shape
+                Xi_tem = Xi_tem.reshape((-1)).int()
+                offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
+                fm_second_order_emb_arr.append((emb(Xi_tem, offsets).view(S, -1, B) * Xv[:, i:].reshape(S, 1, B)).view(B, S, -1))
+        fm_sum_second_order_emb = sum([x if idx != len(fm_second_order_emb_arr)-1 \
+                                        else torch.sum(x, 1) \
+                                        for idx, x in enumerate(fm_second_order_emb_arr)])
         fm_sum_second_order_emb_square = fm_sum_second_order_emb * \
-            fm_sum_second_order_emb  # (x+y)^2
-        fm_second_order_emb_square = [
-            item*item for item in fm_second_order_emb_arr]
-        fm_second_order_emb_square_sum = sum(
-            fm_second_order_emb_square)  # x^2+y^2
-        fm_second_order = (fm_sum_second_order_emb_square -
+                                            fm_sum_second_order_emb  # (x+y)^2
+        fm_second_order_emb_square = [item * item for item in fm_second_order_emb_arr]
+        fm_second_order_emb_square_sum = sum([x if idx != len(fm_second_order_emb_arr)-1 \
+                                                else torch.sum(x, 1) \
+                                                for idx, x in enumerate(fm_second_order_emb_square)])  # x^2+y^2
+        fm_second_order = (fm_sum_second_order_emb_square - \
                            fm_second_order_emb_square_sum) * 0.5
         """
             deep part
         """
-#        print(len(fm_second_order_emb_arr))
-#        print(torch.cat(fm_second_order_emb_arr, 1).shape)
-        deep_emb = torch.cat(fm_second_order_emb_arr, 1)
+        deep_emb = torch.cat([x if idx != len(fm_second_order_emb_arr)-1 \
+                                else x.view(B, -1) \
+                                for idx, x in enumerate(fm_second_order_emb_arr)], 1)
         deep_out = deep_emb
         for i in range(1, len(self.hidden_dims) + 1):
             deep_out = getattr(self, 'linear_' + str(i))(deep_out)
             deep_out = getattr(self, 'batchNorm_' + str(i))(deep_out)
             deep_out = getattr(self, 'dropout_' + str(i))(deep_out)
-#            print("successful") 
         """
             sum
         """
-#        print("1",torch.sum(fm_first_order, 1).shape)
-#        print("2",torch.sum(fm_second_order, 1).shape)
-#        print("deep",torch.sum(deep_out, 1).shape)
-#        print("bias",bias.shape)
         bias = torch.nn.Parameter(torch.randn(Xi.size(0)))
-        total_sum = torch.sum(fm_first_order, 1) + \
-                    torch.sum(fm_second_order, 1) + \
-                    torch.sum(deep_out, 1) + bias
+        if self.use_cuda:
+            bias = bias.cuda()
+        total_sum = torch.sum(fm_first_order, dim=1) + \
+                    torch.sum(fm_second_order, dim=1) + \
+                    torch.sum(deep_out, dim=1) + bias
         return total_sum
 
-    def fit(self, loader_train, loader_val, optimizer, epochs=1, verbose=False, print_every=5):
+    def fit(self, loader_train, loader_val, optimizer, epochs=1, batch_limit=1e9, verbose=False, print_every=5, collect_execution_graph=False):
         """
         Training a model and valid accuracy.
 
@@ -185,30 +224,66 @@ class DeepFM(nn.Module):
         model = self.train().to(device=self.device)
         criterion = F.binary_cross_entropy_with_logits
 
-        for epoch in range(epochs):
-            for t, (xi, xv, y) in enumerate(loader_train):
-                xi = xi.to(device=self.device, dtype=self.dtype)
-                xv = xv.to(device=self.device, dtype=torch.float)
-                y = y.to(device=self.device, dtype=self.dtype)
-                
-                total = model(xi, xv)
-#                print(total.shape)
-#                print(y.shape)
-                loss = criterion(total, y)
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+        class dummy_record_function():
+            def __enter__(self):
+                return None
+            def __exit__(self, exc_type, exc_value, traceback):
+                return False
 
-                if verbose and t % print_every == 0:
-                    print('Epoch %d Iteration %d, loss = %.4f' % (epoch, t, loss.item()))
-                    self.check_accuracy(loader_val, model)
-                    print()
-    
+        event_start = torch.cuda.Event(enable_timing=True)
+        event_end = torch.cuda.Event(enable_timing=True)
+        time_fwd = 0
+        time_bwd = 0
+        batch_count = 0
+
+        for epoch in range(epochs):
+            with record_function("## BENCHMARK ##") if collect_execution_graph else dummy_record_function():
+                for t, (xi, xv, y) in enumerate(loader_train):
+                    if batch_count >= batch_limit:
+                        break
+                    with record_function("## DeepFM distribute emb data ##"):
+                        xi = xi.to(device=self.device, dtype=self.dtype)
+                        xv = xv.to(device=self.device, dtype=torch.float)
+                        y = y.to(device=self.device, dtype=self.dtype)
+                    
+                    with record_function("## Forward ##"):
+                        t1 = _time(self.use_cuda)
+                        if self.use_cuda:
+                            event_start.record()
+                        total = model(xi, xv)
+                        if self.use_cuda:
+                            event_end.record()
+                        t2 = _time(self.use_cuda)
+                    time_fwd += event_start.elapsed_time(event_end) * 1.e-3 if self.use_cuda else (t2 - t1)
+                    with record_function("## Backward ##"):
+                        t1 = _time(self.use_cuda)
+                        if self.use_cuda:
+                            event_start.record()
+                        loss = criterion(total, y)
+                        optimizer.zero_grad()
+                        loss.backward()
+                        optimizer.step()
+                        if self.use_cuda:
+                            event_end.record()
+                        t2 = _time(self.use_cuda)
+                    time_bwd += event_start.elapsed_time(event_end) * 1.e-3 if self.use_cuda else (t2 - t1)
+
+                    if verbose and t % print_every == 0:
+                        print('Epoch %d Iteration %d, loss = %.4f' % (epoch, t, loss.item()))
+                        self.check_accuracy(loader_val, model)
+                    batch_count += 1
+
+        time_fwd_avg = time_fwd / batch_count * 1000
+        time_bwd_avg = time_bwd / batch_count * 1000
+        time_total = time_fwd_avg + time_bwd_avg
+
+        print("Overall per-batch training time: {:.2f} ms".format(time_total))
+
     def check_accuracy(self, loader, model):
         if loader.dataset.train:
-            print('Checking accuracy on validation set')
+            print('  Checking accuracy on validation set')
         else:
-            print('Checking accuracy on test set')   
+            print('  Checking accuracy on test set')   
         num_correct = 0
         num_samples = 0
         model.eval()  # set model to evaluation mode
@@ -218,17 +293,8 @@ class DeepFM(nn.Module):
                 xv = xv.to(device=self.device, dtype=self.dtype)
                 y = y.to(device=self.device, dtype=self.dtype)
                 total = model(xi, xv)
-                preds = (F.sigmoid(total) > 0.5).to(dtype=self.dtype)
-#                print(preds.dtype)
-#                print(y.dtype)
-#                print(preds.eq(y).cpu().sum())
+                preds = (torch.sigmoid(total) > 0.5).to(dtype=self.dtype)
                 num_correct += (preds == y).sum()
                 num_samples += preds.size(0)
-#                print("successful")
             acc = float(num_correct) / num_samples
-            print('Got %d / %d correct (%.2f%%)' % (num_correct, num_samples, 100 * acc))
-
-
-
-
-                        
+            print('  Got %d / %d correct (%.2f%%)' % (num_correct, num_samples, 100 * acc))

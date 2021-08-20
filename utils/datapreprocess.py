@@ -157,21 +157,3 @@ def preprocess(datadir, outdir):
 
 if __name__ == "__main__":
     preprocess('../data/raw', '../data')
-    
-#for test 0923
-
-#datadir = '../data/raw'
-#outdir = '../data'
-#dicts = CategoryDictGenerator(len(categorial_features))
-#dicts.build(
-#    os.path.join(datadir, 'train.txt'), categorial_features, cutoff=10)
-#dict_sizes,dict_test = dicts.dicts_sizes()
-
-
-
-
-
-
-
-
-
