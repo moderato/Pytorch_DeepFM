@@ -148,31 +148,27 @@ class DeepFM(nn.Module):
         # - fm_first_order: (B, 39 * D)
         # - fm_second_order: (B, D)
 
-        fm_first_order_emb_arr = []
-        for i, emb in enumerate(self.fm_first_order_models):
-            if i < 13: # Linear
-                Xi_tem = Xi[:, i, :].to(device=self.device, dtype=torch.float)
-                fm_first_order_emb_arr.append((torch.sum(emb(Xi_tem).unsqueeze(1), 1).t() * Xv[:, i]).t())
-            else: # Emb
-                Xi_tem = Xi[:, i:, :].to(device=self.device, dtype=torch.long)
-                B, S, _ = Xi_tem.shape
-                Xi_tem = Xi_tem.reshape((-1)).int()
-                offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
-                fm_first_order_emb_arr.append((emb(Xi_tem, offsets).view(S, -1, B) * Xv[:, i:].reshape(S, 1, B)).view(B, -1))
-        fm_first_order = torch.cat(fm_first_order_emb_arr, 1)
+        Xi_linear = Xi[:, :13, :].to(device=self.device, dtype=torch.float)
+        Xi_embedding = Xi[:, 13:, :].to(device=self.device, dtype=torch.long)
+        Xi_tem = Xi_embedding.reshape((-1)).int()
+        B, S, _ = Xi_embedding.shape
 
-        # use 2xy = (x+y)^2 - x^2 - y^2 to reduce calculation
-        fm_second_order_emb_arr = []
-        for i, emb in enumerate(self.fm_second_order_models):
-            if i < 13:
-                Xi_tem = Xi[:, i, :].to(device=self.device, dtype=torch.float)
-                fm_second_order_emb_arr.append((torch.sum(emb(Xi_tem).unsqueeze(1), 1).t() * Xv[:, i]).t())
-            else:
-                Xi_tem = Xi[:, i:, :].to(device=self.device, dtype=torch.long)
-                B, S, _ = Xi_tem.shape
-                Xi_tem = Xi_tem.reshape((-1)).int()
-                offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
-                fm_second_order_emb_arr.append((emb(Xi_tem, offsets).view(S, -1, B) * Xv[:, i:].reshape(S, 1, B)).view(B, S, -1))
+        ### First order
+        fm_first_order_emb_arr = [emb(Xi_linear[:, i, :]) for i, emb in enumerate(self.fm_first_order_models[:13])]
+        out_linear = torch.cat(fm_first_order_emb_arr, dim=0)
+        out_linear = torch.mul(out_linear.view(Xi.shape[0], 13, self.embedding_size), Xv[:, :13].unsqueeze(-1)).view(B, -1)
+
+        offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
+        out_embedding = (self.fm_first_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, -1)
+        fm_first_order = torch.cat([out_linear, out_embedding], dim=1)
+
+        ### Second order: use 2xy = (x+y)^2 - x^2 - y^2 to reduce calculation
+        out_linear = [emb(Xi_linear[:, i, :]) for i, emb in enumerate(self.fm_second_order_models[:13])]
+
+        offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
+        out_embedding = (self.fm_second_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, S, -1)
+        fm_second_order_emb_arr = out_linear + [out_embedding]
+        
         fm_sum_second_order_emb = sum([x if idx != len(fm_second_order_emb_arr)-1 \
                                         else torch.sum(x, 1) \
                                         for idx, x in enumerate(fm_second_order_emb_arr)])
