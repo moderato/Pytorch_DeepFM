@@ -235,8 +235,6 @@ class DeepFM(nn.Module):
         for epoch in range(epochs):
             with record_function("## BENCHMARK ##") if collect_execution_graph else dummy_record_function():
                 for t, (xi, xv, y) in enumerate(loader_train):
-                    if batch_count >= batch_limit:
-                        break
                     with record_function("## DeepFM distribute emb data ##"):
                         xi = xi.to(device=self.device, dtype=self.dtype)
                         xv = xv.to(device=self.device, dtype=torch.float)
@@ -268,6 +266,8 @@ class DeepFM(nn.Module):
                         print('Epoch %d Iteration %d, loss = %.4f' % (epoch, t, loss.item()))
                         self.check_accuracy(loader_val, model)
                     batch_count += 1
+                    if batch_count >= batch_limit:
+                        break
 
         time_fwd_avg = time_fwd / batch_count * 1000
         time_bwd_avg = time_bwd / batch_count * 1000

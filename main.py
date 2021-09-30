@@ -30,6 +30,8 @@ if __name__ == '__main__':
                        help='nb of batches in loop to average perf')
     parser.add_argument('--evaluate', action='store_true', default=False,
                        help='evaluate after training')
+    parser.add_argument('--verbose', action='store_true', default=False,
+                       help='check accuracy and print')
     args = parser.parse_args()
     args.cuda = (not args.no_cuda) and torch.cuda.is_available()
 
@@ -50,7 +52,7 @@ if __name__ == '__main__':
     with profiler.profile(args.profile, use_cuda=args.cuda, use_kineto=True) as prof:
         model.fit(loader_train, loader_val, optimizer, \
                     epochs=args.num_epoch, \
-                    verbose=True, \
+                    verbose=args.verbose, \
                     batch_limit=args.num_batches, \
                     print_every=args.print_freq, \
                     collect_execution_graph=args.collect_execution_graph)
