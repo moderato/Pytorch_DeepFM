@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+import table_batched_embeddings_ops
 import graph_observer
 from torch.autograd.profiler import record_function
 from caffe2.python import core
@@ -39,7 +40,7 @@ class DeepFM(nn.Module):
 
     You may find more details in this paper:
     DeepFM: A Factorization-Machine based Neural Network for CTR Prediction,
-    Huifeng Guo, Ruiming Tang, Yunming Yey, Zhenguo Li, Xiuqiang He.
+    Huifeng Guo, Ruiming Tang, Yunming Yey, Zhenguo Li, Xiuqiang He.
     """
 
     def __init__(self, feature_sizes, embedding_size=4,
@@ -80,8 +81,12 @@ class DeepFM(nn.Module):
         """
 
         fm_first_order_Linears = nn.ModuleList(
-                [nn.Linear(feature_size, self.embedding_size) for feature_size in self.feature_sizes[:13]])
-        import table_batched_embeddings_ops
+            [nn.Conv1d(
+                in_channels=self.feature_sizes[0] * 13, 
+                out_channels=self.embedding_size * 13, 
+                kernel_size=1, 
+                groups=13)]
+        ) # "grouped-mm", assuming EQUAL feature sizes for linear 
         fm_first_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             26,
             self.feature_sizes[13:],
@@ -94,7 +99,12 @@ class DeepFM(nn.Module):
         self.fm_first_order_models = fm_first_order_Linears.extend(fm_first_order_embeddings)
 
         fm_second_order_Linears = nn.ModuleList(
-                [nn.Linear(feature_size, self.embedding_size) for feature_size in self.feature_sizes[:13]])
+            [nn.Conv1d(
+                in_channels=self.feature_sizes[0] * 13, 
+                out_channels=self.embedding_size * 13, 
+                kernel_size=1, 
+                groups=13)]
+        ) # "grouped-mm", assuming EQUAL feature sizes for linear 
         fm_second_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             26,
             self.feature_sizes[13:],
@@ -143,8 +153,10 @@ class DeepFM(nn.Module):
         # - embedding output per table: (B, 26, D); Xv shape: (B, 39)
         # - fm_first_order_emb_arr: （B, 26, D), transposed to (26, D, B); 
         # - Xv shape: (B, 39), Xv[:, i:] shape (B, 26), transposed to (26, B)
-        # - fm_first_order_emb_arr: len of 14: 13 (B, D) & 1 (B, 26 * D) -> Pre-concatenated
-        # - fm_second_order_emb_arr: len of 14: 13 (B, D) & 1 (B, 26, D) -> For concat and sum
+        # - fm_first_order_linear: (B, 13 * D) -> (13 * B, D) -> (B, 13 * D)
+        # - fm_first_order_emb: (B, 26 * D)
+        # - fm_second_order_linear: (B, 13 * D) -> (B, 13, D)
+        # - fm_second_order_emb: (B, 26 * D)
         # - fm_first_order: (B, 39 * D)
         # - fm_second_order: (B, D)
 
@@ -154,39 +166,40 @@ class DeepFM(nn.Module):
         B, S, _ = Xi_embedding.shape
 
         ### First order
-        fm_first_order_emb_arr = [emb(Xi_linear[:, i, :]) for i, emb in enumerate(self.fm_first_order_models[:13])]
-        out_linear = torch.cat(fm_first_order_emb_arr, dim=0)
-        out_linear = torch.mul(out_linear.view(Xi.shape[0], 13, self.embedding_size), Xv[:, :13].unsqueeze(-1)).view(B, -1)
+        fm_first_order_linear = self.fm_first_order_models[0](Xi_linear)
+        fm_first_order_linear = torch.transpose(fm_first_order_linear, 0, 1).reshape(-1, self.embedding_size)
+
+        fm_first_order_linear = torch.mul(fm_first_order_linear.view(Xi.shape[0], 13, self.embedding_size), Xv[:, :13].unsqueeze(-1)).view(B, -1)
 
         offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
-        out_embedding = (self.fm_first_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, -1)
-        fm_first_order = torch.cat([out_linear, out_embedding], dim=1)
+        fm_first_order_emb = (self.fm_first_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, -1)
+        fm_first_order = torch.cat([fm_first_order_linear, fm_first_order_emb], dim=1)
 
         ### Second order: use 2xy = (x+y)^2 - x^2 - y^2 to reduce calculation
-        out_linear = [emb(Xi_linear[:, i, :]) for i, emb in enumerate(self.fm_second_order_models[:13])]
-
+        fm_second_order_linear = self.fm_second_order_models[0](Xi_linear)
         offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
-        out_embedding = (self.fm_second_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, S, -1)
-        fm_second_order_emb_arr = out_linear + [out_embedding]
+        fm_second_order_emb = (self.fm_second_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, S, -1)
+
+        """ deep part (executes here before transposing fm_second_order_linear) """
+        deep_emb = torch.cat([fm_second_order_linear.view(B, -1), fm_second_order_emb.view(B, -1)], dim=1)
+        deep_out = deep_emb
+        """ deep part ends """
+
+        fm_second_order_linear = torch.transpose(fm_second_order_linear.reshape(B, -1, self.embedding_size), 0, 1)
+        fm_second_order_emb_arr = [fm_second_order_linear, fm_second_order_emb]
         
-        fm_sum_second_order_emb = sum([x if idx != len(fm_second_order_emb_arr)-1 \
+        fm_sum_second_order_emb = sum([torch.sum(x, 0) if idx != len(fm_second_order_emb_arr)-1 \
                                         else torch.sum(x, 1) \
                                         for idx, x in enumerate(fm_second_order_emb_arr)])
         fm_sum_second_order_emb_square = fm_sum_second_order_emb * \
                                             fm_sum_second_order_emb  # (x+y)^2
         fm_second_order_emb_square = [item * item for item in fm_second_order_emb_arr]
-        fm_second_order_emb_square_sum = sum([x if idx != len(fm_second_order_emb_arr)-1 \
+        fm_second_order_emb_square_sum = sum([torch.sum(x, 0) if idx != len(fm_second_order_emb_arr)-1 \
                                                 else torch.sum(x, 1) \
                                                 for idx, x in enumerate(fm_second_order_emb_square)])  # x^2+y^2
         fm_second_order = (fm_sum_second_order_emb_square - \
                            fm_second_order_emb_square_sum) * 0.5
-        """
-            deep part
-        """
-        deep_emb = torch.cat([x if idx != len(fm_second_order_emb_arr)-1 \
-                                else x.view(B, -1) \
-                                for idx, x in enumerate(fm_second_order_emb_arr)], 1)
-        deep_out = deep_emb
+
         for i in range(1, len(self.hidden_dims) + 1):
             deep_out = getattr(self, 'linear_' + str(i))(deep_out)
             deep_out = getattr(self, 'batchNorm_' + str(i))(deep_out)
