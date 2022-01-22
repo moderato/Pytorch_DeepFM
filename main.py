@@ -10,6 +10,19 @@ import argparse
 from model.DeepFM import DeepFM
 from data.dataset import CriteoDataset
 
+def dash_separated_ints(value):
+    vals = value.split("-")
+    for val in vals:
+        try:
+            int(val)
+        except ValueError:
+            raise argparse.ArgumentTypeError(
+                "%s is not a valid dash separated list of ints" % value
+            )
+
+    return value
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='PyTorch DeepFM Benchmark')
     parser.add_argument('--no-cuda', action='store_true', default=False,
@@ -19,6 +32,10 @@ if __name__ == '__main__':
     parser.add_argument('--collect-execution-graph', action='store_true', default=False,
                        help='collect execution graph')
     parser.add_argument("--batch-size", type=int, default=64,
+                       help='batch size')
+    parser.add_argument("--embedding-dim", type=int, default=4,
+                       help='batch size')
+    parser.add_argument("--mlp-hidden-size", type=dash_separated_ints, default="32-32",
                        help='batch size')
     parser.add_argument("--num-epoch", type=int, default=20,
                        help='nb of epochs in loop to average perf')
@@ -47,14 +64,17 @@ if __name__ == '__main__':
     feature_sizes = [int(x) for x in feature_sizes]
     # print(feature_sizes)
 
-    model = DeepFM(feature_sizes, use_cuda=args.cuda)
+    model = DeepFM(feature_sizes,
+                    embedding_size=args.embedding_dim,
+                    hidden_dims=np.fromstring(args.mlp_hidden_size, dtype=int, sep="-").tolist(),
+                    use_cuda=args.cuda)
     optimizer = optim.SGD(model.parameters(), lr=1e-9, momentum=0.9)
     with profiler.profile(args.profile, use_cuda=args.cuda, use_kineto=True) as prof:
-        model.fit(loader_train, loader_val, optimizer, \
-                    epochs=args.num_epoch, \
-                    verbose=args.verbose, \
-                    batch_limit=args.num_batches, \
-                    print_every=args.print_freq, \
+        model.fit(loader_train, loader_val, optimizer,
+                    epochs=args.num_epoch,
+                    verbose=args.verbose,
+                    batch_limit=args.num_batches,
+                    print_every=args.print_freq,
                     collect_execution_graph=args.collect_execution_graph)
 
     if args.profile:

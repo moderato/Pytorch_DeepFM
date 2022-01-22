@@ -7,7 +7,6 @@ A pytorch implementation of DeepFM for rates prediction problem.
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
 import table_batched_embeddings_ops
 import graph_observer
 from torch.autograd.profiler import record_function
