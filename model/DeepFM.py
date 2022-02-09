@@ -81,11 +81,11 @@ class DeepFM(nn.Module):
 
         fm_first_order_Linears = nn.ModuleList(
             [nn.Conv1d(
-                in_channels=self.feature_sizes[0] * 13, 
-                out_channels=self.embedding_size * 13, 
-                kernel_size=1, 
+                in_channels=self.feature_sizes[0] * 13,
+                out_channels=self.embedding_size * 13,
+                kernel_size=1,
                 groups=13)]
-        ) # "grouped-mm", assuming EQUAL feature sizes for linear 
+        ) # "parallel multi-head mm", assuming EQUAL feature sizes for linear 
         fm_first_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             26,
             self.feature_sizes[13:],
@@ -99,11 +99,12 @@ class DeepFM(nn.Module):
 
         fm_second_order_Linears = nn.ModuleList(
             [nn.Conv1d(
-                in_channels=self.feature_sizes[0] * 13, 
-                out_channels=self.embedding_size * 13, 
-                kernel_size=1, 
+                in_channels=self.feature_sizes[0] * 13,
+                out_channels=self.embedding_size * 13,
+                kernel_size=1,
                 groups=13)]
-        ) # "grouped-mm", assuming EQUAL feature sizes for linear 
+        ) # "parallel multi-head mm", assuming EQUAL feature sizes for linear
+        print(fm_second_order_Linears)
         fm_second_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             26,
             self.feature_sizes[13:],
@@ -214,7 +215,7 @@ class DeepFM(nn.Module):
                     torch.sum(deep_out, dim=1) + bias
         return total_sum
 
-    def fit(self, loader_train, loader_val, optimizer, epochs=1, batch_limit=1e9, verbose=False, print_every=5, collect_execution_graph=False):
+    def fit(self, loader_train, loader_val, optimizer, batch_size=32, epochs=1, warmup=5, batch_limit=1e9, verbose=False, print_every=5, collect_execution_graph=False):
         """
         Training a model and valid accuracy.
 
@@ -243,6 +244,22 @@ class DeepFM(nn.Module):
         time_fwd = 0
         time_bwd = 0
         batch_count = 0
+        should_return = False
+
+        # Warm up
+        for t, (xi, xv, y) in enumerate(loader_train):
+            xi = xi.to(device=self.device, dtype=self.dtype)
+            xv = xv.to(device=self.device, dtype=torch.float)
+            y = y.to(device=self.device, dtype=self.dtype)
+            total = model(xi, xv)
+            loss = criterion(total, y)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            batch_count += 1
+            if batch_count >= warmup:
+                batch_count = 0
+                break
 
         for epoch in range(epochs):
             with record_function("## BENCHMARK ##") if collect_execution_graph else dummy_record_function():
@@ -251,6 +268,8 @@ class DeepFM(nn.Module):
                         xi = xi.to(device=self.device, dtype=self.dtype)
                         xv = xv.to(device=self.device, dtype=torch.float)
                         y = y.to(device=self.device, dtype=self.dtype)
+                    if xi.shape[0] != batch_size:
+                        continue
                     
                     with record_function("## Forward ##"):
                         t1 = _time(self.use_cuda)
@@ -279,7 +298,10 @@ class DeepFM(nn.Module):
                         self.check_accuracy(loader_val, model)
                     batch_count += 1
                     if batch_count >= batch_limit:
+                        should_return = True
                         break
+            if should_return:
+                break
 
         time_fwd_avg = time_fwd / batch_count * 1000
         time_bwd_avg = time_bwd / batch_count * 1000
@@ -291,7 +313,7 @@ class DeepFM(nn.Module):
         if loader.dataset.train:
             print('  Checking accuracy on validation set')
         else:
-            print('  Checking accuracy on test set')   
+            print('  Checking accuracy on test set')
         num_correct = 0
         num_samples = 0
         model.eval()  # set model to evaluation mode

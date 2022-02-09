@@ -43,6 +43,8 @@ if __name__ == '__main__':
                        help='nb of batches in loop to average perf')
     parser.add_argument("--print-freq", type=int, default=5,
                        help='print frequency')
+    parser.add_argument("--warmup-batches", type=int, default=5,
+                       help='warm up batches')
     parser.add_argument("--engine-type", type=str, default='gmf',
                        help='nb of batches in loop to average perf')
     parser.add_argument('--evaluate', action='store_true', default=False,
@@ -71,7 +73,9 @@ if __name__ == '__main__':
     optimizer = optim.SGD(model.parameters(), lr=1e-9, momentum=0.9)
     with profiler.profile(args.profile, use_cuda=args.cuda, use_kineto=True) as prof:
         model.fit(loader_train, loader_val, optimizer,
+                    batch_size=args.batch_size,
                     epochs=args.num_epoch,
+                    warmup=args.warmup_batches,
                     verbose=args.verbose,
                     batch_limit=args.num_batches,
                     print_every=args.print_freq,
