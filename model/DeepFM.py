@@ -79,14 +79,13 @@ class DeepFM(nn.Module):
             init fm part
         """
 
-        fm_first_order_Linears = nn.ModuleList(
-            [nn.Conv1d(
+        self.fm_first_order_Linears = nn.Conv1d(
                 in_channels=self.feature_sizes[0] * 13,
                 out_channels=self.embedding_size * 13,
                 kernel_size=1,
-                groups=13)]
+                groups=13
         ) # "parallel multi-head mm", assuming EQUAL feature sizes for linear 
-        fm_first_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+        self.fm_first_order_Embeddings = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             26,
             self.feature_sizes[13:],
             self.embedding_size,
@@ -94,18 +93,15 @@ class DeepFM(nn.Module):
             learning_rate=1e-9,
             eps=None,
             stochastic_rounding=False,
-        )])
-        self.fm_first_order_models = fm_first_order_Linears.extend(fm_first_order_embeddings)
+        )
 
-        fm_second_order_Linears = nn.ModuleList(
-            [nn.Conv1d(
+        self.fm_second_order_Linears = nn.Conv1d(
                 in_channels=self.feature_sizes[0] * 13,
                 out_channels=self.embedding_size * 13,
                 kernel_size=1,
-                groups=13)]
+                groups=13
         ) # "parallel multi-head mm", assuming EQUAL feature sizes for linear
-        print(fm_second_order_Linears)
-        fm_second_order_embeddings = nn.ModuleList([table_batched_embeddings_ops.TableBatchedEmbeddingBags(
+        self.fm_second_order_Embeddings = table_batched_embeddings_ops.TableBatchedEmbeddingBags(
             26,
             self.feature_sizes[13:],
             self.embedding_size,
@@ -113,8 +109,7 @@ class DeepFM(nn.Module):
             learning_rate=1e-9,
             eps=None,
             stochastic_rounding=False,
-        )])
-        self.fm_second_order_models = fm_second_order_Linears.extend(fm_second_order_embeddings)
+        )
 
         """
             init deep part
@@ -161,24 +156,22 @@ class DeepFM(nn.Module):
         # - fm_second_order: (B, D)
 
         Xi_linear = Xi[:, :13, :].to(device=self.device, dtype=torch.float)
-        Xi_embedding = Xi[:, 13:, :].to(device=self.device, dtype=torch.long)
-        Xi_tem = Xi_embedding.reshape((-1)).int()
-        B, S, _ = Xi_embedding.shape
+        Xi_tem = Xi[:, 13:, :].to(device=self.device, dtype=torch.int32).view(-1)
+        B, S, _ = Xi.shape
+        S -= 13 # To avoid slicing
+        offsets = torch.arange(0, B*S+1, dtype=torch.int32).cuda()
 
         ### First order
-        fm_first_order_linear = self.fm_first_order_models[0](Xi_linear)
+        fm_first_order_linear = self.fm_first_order_Linears(Xi_linear)
         fm_first_order_linear = torch.transpose(fm_first_order_linear, 0, 1).reshape(-1, self.embedding_size)
-
         fm_first_order_linear = torch.mul(fm_first_order_linear.view(Xi.shape[0], 13, self.embedding_size), Xv[:, :13].unsqueeze(-1)).view(B, -1)
 
-        offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
-        fm_first_order_emb = (self.fm_first_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, -1)
+        fm_first_order_emb = (self.fm_first_order_Embeddings(Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, -1)
         fm_first_order = torch.cat([fm_first_order_linear, fm_first_order_emb], dim=1)
 
         ### Second order: use 2xy = (x+y)^2 - x^2 - y^2 to reduce calculation
-        fm_second_order_linear = self.fm_second_order_models[0](Xi_linear)
-        offsets = torch.tensor(range(B*S+1), dtype=torch.int32).cuda()
-        fm_second_order_emb = (self.fm_second_order_models[-1](Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, S, -1)
+        fm_second_order_linear = self.fm_second_order_Linears(Xi_linear)
+        fm_second_order_emb = (self.fm_second_order_Embeddings(Xi_tem, offsets).view(S, -1, B) * Xv[:, 13:].reshape(S, 1, B)).view(B, S, -1)
 
         """ deep part (executes here before transposing fm_second_order_linear) """
         deep_emb = torch.cat([fm_second_order_linear.view(B, -1), fm_second_order_emb.view(B, -1)], dim=1)
