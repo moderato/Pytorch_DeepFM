@@ -56,11 +56,9 @@ if __name__ == '__main__':
 
     # load data
     train_data = CriteoDataset('./data', train=True)
-    loader_train = DataLoader(train_data, batch_size=args.batch_size,
-                            sampler=sampler.SubsetRandomSampler(range(8194)))
+    loader_train = DataLoader(train_data, batch_size=args.batch_size)
     val_data = CriteoDataset('./data', train=True)
-    loader_val = DataLoader(val_data, batch_size=128,
-                            sampler=sampler.SubsetRandomSampler(range(8194, 8293)))
+    loader_val = DataLoader(val_data, batch_size=128)
 
     feature_sizes = np.loadtxt('./data/feature_sizes.txt', delimiter=',')
     feature_sizes = [int(x) for x in feature_sizes]

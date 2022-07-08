@@ -8,16 +8,19 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import table_batched_embeddings_ops
-import graph_observer
 from torch.autograd.profiler import record_function
-from caffe2.python import core
-core.GlobalInit(
-    [
-        "python",
-        "--pytorch_enable_execution_graph_observer=true",
-        "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
-    ]
-)
+from torch.profiler import ExecutionGraphObserver
+import tempfile
+
+# import graph_observer
+# from caffe2.python import core
+# core.GlobalInit(
+#     [
+#         "python",
+#         "--pytorch_enable_execution_graph_observer=true",
+#         "--pytorch_execution_graph_observer_iter_label=## BENCHMARK ##",
+#     ]
+# )
 
 from time import time
 
@@ -226,11 +229,11 @@ class DeepFM(nn.Module):
         model = self.train().to(device=self.device)
         criterion = F.binary_cross_entropy_with_logits
 
-        class dummy_record_function():
-            def __enter__(self):
-                return None
-            def __exit__(self, exc_type, exc_value, traceback):
-                return False
+        if collect_execution_graph:
+            fp = tempfile.NamedTemporaryFile('w+t', prefix='/tmp/pytorch_execution_graph_', suffix='.json', delete=False)
+            fp.close()
+            eg = ExecutionGraphObserver()
+            eg.register_callback(fp.name)
 
         event_start = torch.cuda.Event(enable_timing=True)
         event_end = torch.cuda.Event(enable_timing=True)
@@ -255,44 +258,47 @@ class DeepFM(nn.Module):
                 break
 
         for epoch in range(epochs):
-            with record_function("## BENCHMARK ##") if collect_execution_graph else dummy_record_function():
-                for t, (xi, xv, y) in enumerate(loader_train):
-                    with record_function("## DeepFM distribute emb data ##"):
+            for t, (xi, xv, y) in enumerate(loader_train):
+                if xi.shape[0] != batch_size:
+                    continue
+                if t == 0 and collect_execution_graph:
+                    eg.start()
+                with record_function("## Forward ##"):
+                    with record_function("module::forward_pass::transfer_gpu_data"):
                         xi = xi.to(device=self.device, dtype=self.dtype)
                         xv = xv.to(device=self.device, dtype=torch.float)
                         y = y.to(device=self.device, dtype=self.dtype)
-                    if xi.shape[0] != batch_size:
-                        continue
-                    
-                    with record_function("## Forward ##"):
-                        t1 = _time(self.use_cuda)
-                        if self.use_cuda:
-                            event_start.record()
-                        total = model(xi, xv)
-                        if self.use_cuda:
-                            event_end.record()
-                        t2 = _time(self.use_cuda)
-                    time_fwd += event_start.elapsed_time(event_end) * 1.e-3 if self.use_cuda else (t2 - t1)
-                    with record_function("## Backward ##"):
-                        t1 = _time(self.use_cuda)
-                        if self.use_cuda:
-                            event_start.record()
-                        loss = criterion(total, y)
-                        optimizer.zero_grad()
-                        loss.backward()
-                        optimizer.step()
-                        if self.use_cuda:
-                            event_end.record()
-                        t2 = _time(self.use_cuda)
-                    time_bwd += event_start.elapsed_time(event_end) * 1.e-3 if self.use_cuda else (t2 - t1)
+                    t1 = _time(self.use_cuda)
+                    if self.use_cuda:
+                        event_start.record()
+                    total = model(xi, xv)
+                    if self.use_cuda:
+                        event_end.record()
+                    t2 = _time(self.use_cuda)
+                time_fwd += event_start.elapsed_time(event_end) * 1.e-3 if self.use_cuda else (t2 - t1)
+                with record_function("## Backward ##"):
+                    t1 = _time(self.use_cuda)
+                    if self.use_cuda:
+                        event_start.record()
+                    loss = criterion(total, y)
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    if self.use_cuda:
+                        event_end.record()
+                    t2 = _time(self.use_cuda)
+                if t == 0 and collect_execution_graph:
+                    eg.stop()
+                    eg.unregister_callback()
+                time_bwd += event_start.elapsed_time(event_end) * 1.e-3 if self.use_cuda else (t2 - t1)
 
-                    if verbose and t % print_every == 0:
-                        print('Epoch %d Iteration %d, loss = %.4f' % (epoch, t, loss.item()))
-                        self.check_accuracy(loader_val, model)
-                    batch_count += 1
-                    if batch_count >= batch_limit:
-                        should_return = True
-                        break
+                if verbose and t % print_every == 0:
+                    print('Epoch %d Iteration %d, loss = %.4f' % (epoch, t, loss.item()))
+                    self.check_accuracy(loader_val, model)
+                batch_count += 1
+                if batch_count >= batch_limit:
+                    should_return = True
+                    break
             if should_return:
                 break
 

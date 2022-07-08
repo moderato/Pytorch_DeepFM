@@ -25,10 +25,12 @@ class CriteoDataset(Dataset):
 
         if self.train:
             data = pd.read_csv(os.path.join(root, 'train.txt'))
+            data = pd.concat([data] * 1000)
             self.train_data = data.iloc[:, :-1].values
             self.target = data.iloc[:, -1].values
         else:
             data = pd.read_csv(os.path.join(root, 'test.txt'))
+            data = pd.concat([data] * 1000)
             self.test_data = data.iloc[:, :-1].values
     
     def __getitem__(self, idx):
