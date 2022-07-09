@@ -239,7 +239,7 @@ class DeepFM(nn.Module):
         event_end = torch.cuda.Event(enable_timing=True)
         time_fwd = 0
         time_bwd = 0
-        batch_count = 0
+        global_batch_count = 0
         should_return = False
 
         # Warm up
@@ -252,16 +252,16 @@ class DeepFM(nn.Module):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            batch_count += 1
-            if batch_count >= warmup:
-                batch_count = 0
+            global_batch_count += 1
+            if global_batch_count >= warmup:
+                global_batch_count = 0
                 break
 
         for epoch in range(epochs):
             for t, (xi, xv, y) in enumerate(loader_train):
                 if xi.shape[0] != batch_size:
                     continue
-                if t == 0 and collect_execution_graph:
+                if global_batch_count == 0 and collect_execution_graph:
                     eg.start()
                 with record_function("## Forward ##"):
                     with record_function("module::forward_pass::transfer_gpu_data"):
@@ -287,23 +287,23 @@ class DeepFM(nn.Module):
                     if self.use_cuda:
                         event_end.record()
                     t2 = _time(self.use_cuda)
-                if t == 0 and collect_execution_graph:
+                if global_batch_count == 0 and collect_execution_graph:
                     eg.stop()
                     eg.unregister_callback()
                 time_bwd += event_start.elapsed_time(event_end) * 1.e-3 if self.use_cuda else (t2 - t1)
 
-                if verbose and t % print_every == 0:
+                if verbose and global_batch_count % print_every == 0:
                     print('Epoch %d Iteration %d, loss = %.4f' % (epoch, t, loss.item()))
                     self.check_accuracy(loader_val, model)
-                batch_count += 1
-                if batch_count >= batch_limit:
+                global_batch_count += 1
+                if global_batch_count >= batch_limit:
                     should_return = True
                     break
             if should_return:
                 break
 
-        time_fwd_avg = time_fwd / batch_count * 1000
-        time_bwd_avg = time_bwd / batch_count * 1000
+        time_fwd_avg = time_fwd / global_batch_count * 1000
+        time_bwd_avg = time_bwd / global_batch_count * 1000
         time_total = time_fwd_avg + time_bwd_avg
 
         print("Overall per-batch training time: {:.2f} ms".format(time_total))
